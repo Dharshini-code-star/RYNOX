@@ -1,0 +1,34 @@
+appId: com.argus.desktop
+productName: RYNOX
+copyright: Copyright © 2026 RYNOX contributors
+
+# uiohook-napi and nut-js ship prebuilt N-API binaries, which are ABI-stable
+# across Node and Electron versions - that is the whole point of N-API. Letting
+# electron-builder rebuild them from source only adds a Visual Studio
+# requirement that nobody packaging this app should need.
+npmRebuild: false
+
+directories:
+  output: release
+  buildResources: resources
+
+files:
+  - out/**
+  - resources/icon.png
+  - package.json
+
+# The keyboard hook is a native binary and can't be loaded from inside the asar.
+asarUnpack:
+  - '**/*.node'
+
+win:
+  target: nsis
+  icon: resources/icon.png
+  artifactName: RYNOX-${version}-Setup.${ext}
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  shortcutName: RYNOX

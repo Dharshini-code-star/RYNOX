@@ -1,0 +1,1023 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'"
+    />
+    <title>RYNOX Agent</title>
+    <style>
+      /*
+       * The overlay borrows the bar's surface language: near-white plates lit
+       * from above, pill geometry, and red for the one thing that matters here
+       * - that the machine is being driven by something other than the person
+       * in front of it.
+       */
+      :root {
+        --bg: #08090d;
+        --bg-soft: rgba(17, 18, 24, 0.92);
+        --agent: rgba(255, 23, 68, 0.96);
+        --agent-solid: #ff1744;
+        --agent-deep: #ff4569;
+        --agent-gloss: linear-gradient(135deg, #ff4569 0%, #ff1744 100%);
+        --plate: rgba(17, 18, 24, 0.96);
+        --ink: #fff;
+        --muted: #a1a1aa;
+        --edge: rgba(255, 255, 255, 0.08);
+        --hi: rgba(255, 255, 255, 0.08);
+        --teach: #8fb0ff;
+      }
+
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: transparent;
+        font-family: 'Segoe UI Variable Text', 'Segoe UI', system-ui, sans-serif;
+        letter-spacing: -0.011em;
+        -webkit-user-select: none;
+        user-select: none;
+      }
+
+      /* A border, not a fill - the user must still see what is happening. */
+      .frame {
+        position: fixed;
+        inset: 0;
+        border: 3px solid var(--agent);
+        box-shadow: inset 0 0 40px rgba(255, 23, 68, 0.18), 0 0 32px rgba(255, 23, 68, 0.14);
+        animation: pulse 2s ease-in-out infinite;
+      }
+
+      @keyframes pulse {
+        0%,
+        100% {
+          opacity: 1;
+        }
+        50% {
+          opacity: 0.55;
+        }
+      }
+
+      .banner {
+        position: fixed;
+        top: 18px;
+        left: 50%;
+        transform: translateX(-50%);
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 10px 18px;
+        border: 1px solid var(--edge);
+        border-radius: 999px;
+        background: var(--plate);
+        backdrop-filter: blur(20px) saturate(180%);
+        color: var(--ink);
+        font-size: 13px;
+        box-shadow:
+          0 12px 32px rgba(0, 0, 0, 0.3),
+          inset 0 1px 1px var(--hi),
+          inset 0 0 0 1px rgba(255, 255, 255, 0.35);
+        white-space: nowrap;
+        max-width: 90vw;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--agent-solid);
+        box-shadow: 0 0 0 3px rgba(255, 23, 68, 0.16);
+        flex: none;
+      }
+
+      .step {
+        color: var(--muted);
+      }
+
+      /* Long actions shorten; the to-do pill and the Esc hint never do. */
+      #action {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      /* ---- To-do list ---------------------------------------------------- */
+
+      /*
+       * The pill replaces "step 7/50": how far through THIS task's own to-do
+       * list the agent is. It is the one thing on the banner that takes a
+       * click - opening the list underneath.
+       */
+      .todo-pill {
+        flex: none;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 3px 9px 3px 7px;
+        border: 1px solid rgba(255, 69, 105, 0.35);
+        border-radius: 999px;
+        background: rgba(255, 23, 68, 0.07);
+        color: var(--agent-deep);
+        font: inherit;
+        font-size: 12px;
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
+        cursor: pointer;
+        transition:
+          background 120ms ease,
+          transform 120ms ease;
+      }
+
+      .todo-pill[hidden],
+      .todo-card[hidden] {
+        display: none;
+      }
+
+      .todo-pill:hover {
+        background: rgba(255, 23, 68, 0.14);
+      }
+
+      .todo-pill-box {
+        position: relative;
+        width: 11px;
+        height: 11px;
+        box-sizing: border-box;
+        border: 1.5px solid currentColor;
+        border-radius: 3px;
+      }
+
+      .todo-pill.all-done .todo-pill-box {
+        border-color: var(--agent-solid);
+        background: var(--agent-solid);
+      }
+
+      .todo-pill.all-done .todo-pill-box::after {
+        content: '✓';
+        position: absolute;
+        inset: -3px 0 0 0;
+        color: #fff;
+        font-size: 9px;
+        font-weight: 800;
+        text-align: center;
+      }
+
+      .todo-chev {
+        font-size: 9px;
+        transition: transform 160ms ease;
+      }
+
+      .todo-pill.open .todo-chev {
+        transform: rotate(180deg);
+      }
+
+      /* A to-do just got ticked: the pill gives a small nudge. */
+      .todo-pill.bump {
+        animation: bump 420ms cubic-bezier(0.3, 1.6, 0.5, 1);
+      }
+
+      @keyframes bump {
+        30% {
+          transform: scale(1.14);
+        }
+      }
+
+      .todo-card {
+        position: fixed;
+        top: 66px;
+        left: 50%;
+        transform: translateX(-50%);
+        width: min(360px, 90vw);
+        box-sizing: border-box;
+        padding: 14px 16px 8px;
+        border: 1px solid var(--edge);
+        border-radius: 18px;
+        background: var(--plate);
+        backdrop-filter: blur(20px) saturate(180%);
+        color: var(--ink);
+        box-shadow:
+          0 18px 44px rgba(0, 0, 0, 0.28),
+          inset 0 1px 1px var(--hi);
+        animation: approval-in 200ms cubic-bezier(0.2, 0.8, 0.25, 1);
+      }
+
+      /* An approval question outranks the list - it gets the space. */
+      body[data-approval='true'] .todo-card,
+      body[data-kind='teach'] .todo-card,
+      body[data-kind='teach'] .todo-pill {
+        display: none;
+      }
+
+      .todo-head {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+        color: var(--agent-deep);
+      }
+
+      .todo-summary {
+        font-size: 12px;
+        font-weight: 500;
+        letter-spacing: 0;
+        text-transform: none;
+        color: var(--muted);
+      }
+
+      .todo-bar {
+        margin-top: 9px;
+        height: 4px;
+        border-radius: 999px;
+        background: rgba(0, 0, 0, 0.08);
+        overflow: hidden;
+      }
+
+      .todo-bar-fill {
+        width: 0;
+        height: 100%;
+        border-radius: 999px;
+        background: var(--agent-gloss);
+        transition: width 380ms cubic-bezier(0.2, 0.8, 0.2, 1);
+      }
+
+      .todo-list {
+        margin: 8px 0 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .todo {
+        display: flex;
+        align-items: flex-start;
+        gap: 10px;
+        padding: 7px 0;
+        font-size: 13.5px;
+        line-height: 1.35;
+      }
+
+      .todo + .todo {
+        border-top: 1px solid rgba(0, 0, 0, 0.05);
+      }
+
+      .todo-box {
+        flex: none;
+        display: grid;
+        place-items: center;
+        width: 18px;
+        height: 18px;
+        box-sizing: border-box;
+        border: 1.5px solid #c4c4c9;
+        border-radius: 6px;
+        background: #fff;
+      }
+
+      /* The one being worked on: a red box with a breathing square in it. */
+      .todo.active .todo-box {
+        border-color: var(--agent-solid);
+      }
+
+      .todo.active .todo-box::after {
+        content: '';
+        width: 8px;
+        height: 8px;
+        border-radius: 3px;
+        background: var(--agent-solid);
+        animation: pulse 1.4s ease-in-out infinite;
+      }
+
+      .todo.active .todo-text {
+        font-weight: 600;
+      }
+
+      .todo.done .todo-box {
+        border-color: var(--agent-deep);
+        background: var(--agent-gloss);
+      }
+
+      .todo.done .todo-box::after {
+        content: '✓';
+        color: #fff;
+        font-size: 12px;
+        font-weight: 800;
+        line-height: 1;
+      }
+
+      .todo.done .todo-text {
+        color: var(--muted);
+        text-decoration: line-through;
+        text-decoration-color: rgba(0, 0, 0, 0.25);
+      }
+
+      /* Ticked this moment: the check pops in. */
+      .todo.just-done .todo-box {
+        animation: tick-pop 420ms cubic-bezier(0.3, 1.6, 0.5, 1);
+      }
+
+      @keyframes tick-pop {
+        from {
+          transform: scale(0.55);
+        }
+      }
+
+      kbd {
+        padding: 1px 6px;
+        border: 1px solid var(--edge);
+        border-radius: 5px;
+        background: linear-gradient(#fff 0%, #e7e7e7 42%, #fbfbfb 100%);
+        box-shadow: 0 1px 1px rgba(0, 0, 0, 0.1), inset 0 1px 1px var(--hi);
+        color: var(--ink);
+        font-family: inherit;
+        font-size: 11px;
+      }
+
+      /*
+       * The pointer marker. The real Windows cursor is still the thing doing the
+       * clicking - this only rings it, so it is obvious which movements are the
+       * agent's and which are the user's.
+       */
+      .halo,
+      .trail {
+        position: fixed;
+        top: 0;
+        left: 0;
+        border-radius: 50%;
+        pointer-events: none;
+        will-change: transform, opacity;
+      }
+
+      .halo {
+        width: 38px;
+        height: 38px;
+        margin: -19px 0 0 -19px;
+        border: 2px solid rgba(255, 23, 68, 0.95);
+        background: radial-gradient(
+          circle,
+          rgba(255, 23, 68, 0.28) 0%,
+          rgba(255, 23, 68, 0.06) 55%,
+          transparent 70%
+        );
+        box-shadow:
+          0 0 18px rgba(255, 23, 68, 0.55),
+          inset 0 0 10px rgba(255, 23, 68, 0.35);
+        transition: opacity 260ms ease;
+      }
+
+      /* A second cursor for the agent; the real Windows cursor still acts. */
+      .agent-hand {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 38px;
+        height: 44px;
+        margin: -39px 0 0 -14px;
+        color: #000;
+        font-family: 'Segoe UI Symbol', 'Noto Sans Symbols 2', sans-serif;
+        font-size: 42px;
+        line-height: 1;
+        pointer-events: none;
+        filter: drop-shadow(0 2px 3px rgba(255, 255, 255, 0.85));
+        transition: opacity 260ms ease;
+      }
+
+      /*
+       * Each dot chases the same point with a longer transition than the one
+       * before it, so the lag alone draws the tail. Nothing is created or
+       * destroyed per frame.
+       */
+      .trail {
+        width: 10px;
+        height: 10px;
+        margin: -5px 0 0 -5px;
+        background: rgba(255, 23, 68, 0.5);
+        transition:
+          transform 90ms linear,
+          opacity 260ms ease;
+      }
+
+      .trail.t1 {
+        transition-duration: 120ms, 260ms;
+        opacity: 0.4;
+      }
+
+      .trail.t2 {
+        transition-duration: 210ms, 260ms;
+        opacity: 0.24;
+      }
+
+      .trail.t3 {
+        transition-duration: 320ms, 260ms;
+        opacity: 0.12;
+      }
+
+      /* Set by script once the agent has a position to show. */
+      .pointer[hidden] {
+        display: none;
+      }
+
+      .pointer.idle .halo,
+      .pointer.idle .trail,
+      .pointer.idle .agent-hand {
+        opacity: 0.25;
+      }
+
+      .ripple {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 20px;
+        height: 20px;
+        margin: -10px 0 0 -10px;
+        border-radius: 50%;
+        border: 2px solid rgba(255, 23, 68, 0.9);
+        pointer-events: none;
+        animation: ripple 460ms cubic-bezier(0.2, 0.7, 0.3, 1) forwards;
+      }
+
+      @keyframes ripple {
+        from {
+          opacity: 0.9;
+          scale: 0.4;
+        }
+        to {
+          opacity: 0;
+          scale: 3.4;
+        }
+      }
+
+      /*
+       * Paused: the user reached for the mouse, so the agent stood aside.
+       *
+       * Grey and still, deliberately. Red pulsing means "this machine is being
+       * driven, keep your hands off"; the whole point of pausing is that the
+       * opposite is now true, and a frame that still looked alarming would be
+       * telling them not to do the thing they just did.
+       */
+      body[data-paused='true'] .frame {
+        border-color: rgba(120, 120, 126, 0.7);
+        box-shadow: inset 0 0 40px rgba(120, 120, 126, 0.1);
+        animation: none;
+      }
+
+      body[data-paused='true'] .dot {
+        background: #8a8a8e;
+        box-shadow: none;
+        animation: none;
+      }
+
+      body[data-paused='true'] .pointer,
+      body[data-paused='true'] .ripple {
+        display: none;
+      }
+
+      /* ---- Teach Mode ---------------------------------------------------- */
+
+      /*
+       * Blue, not red. Red means the machine is driving itself; here it only
+       * points, and the learner keeps the mouse. Same frame, different promise
+       * - so it must not look the same.
+       */
+      body[data-kind='teach'] .frame {
+        border-color: rgba(22, 104, 214, 0.9);
+        box-shadow: inset 0 0 40px rgba(22, 104, 214, 0.14);
+        animation: none;
+      }
+
+      body[data-kind='teach'] .dot {
+        background: var(--teach);
+        box-shadow: 0 0 0 3px rgba(22, 104, 214, 0.16);
+      }
+
+      /* The agent's own pointer decoration has no business in a lesson. */
+      body[data-kind='teach'] .pointer,
+      body[data-kind='teach'] .ripple {
+        display: none;
+      }
+
+      .ghost {
+        position: fixed;
+        top: 0;
+        left: 0;
+        pointer-events: none;
+        will-change: transform;
+        transition: transform 420ms cubic-bezier(0.22, 0.68, 0.24, 1);
+      }
+
+      .ghost[hidden] {
+        display: none;
+      }
+
+      /* Expanding ring, so the eye finds the pointer before reading anything. */
+      .ghost-ping {
+        position: absolute;
+        left: -26px;
+        top: -26px;
+        width: 52px;
+        height: 52px;
+        border-radius: 50%;
+        border: 2px solid rgba(22, 104, 214, 0.8);
+        animation: ghost-ping 1.8s ease-out infinite;
+      }
+
+      @keyframes ghost-ping {
+        0% {
+          opacity: 0.85;
+          scale: 0.45;
+        }
+        70%,
+        100% {
+          opacity: 0;
+          scale: 1.6;
+        }
+      }
+
+      /*
+       * Teach Mode points, so it shows the pointing hand - at twice size, with
+       * crisp pixels, because a learner has to find it across the screen. The
+       * fingertip is at (13, 8) in the 32px drawing, so (26, 16) here.
+       */
+      .ghost-arrow {
+        position: absolute;
+        left: -26px;
+        top: -16px;
+        width: 64px;
+        height: 64px;
+        image-rendering: pixelated;
+        filter: drop-shadow(0 3px 6px rgba(0, 0, 0, 0.4));
+      }
+
+      .caption {
+        position: absolute;
+        left: 26px;
+        top: 30px;
+        width: max-content;
+        max-width: 340px;
+        padding: 13px 15px;
+        border: 1px solid rgba(22, 104, 214, 0.32);
+        border-radius: 16px;
+        background: var(--plate);
+        backdrop-filter: blur(20px) saturate(180%);
+        color: var(--ink);
+        box-shadow:
+          0 16px 40px rgba(0, 0, 0, 0.3),
+          inset 0 1px 1px var(--hi);
+      }
+
+      /* Near an edge the caption would run off screen, so it swaps sides. */
+      .ghost[data-flip-x='true'] .caption {
+        left: auto;
+        right: 26px;
+      }
+
+      .ghost[data-flip-y='true'] .caption {
+        top: auto;
+        bottom: 30px;
+      }
+
+      .caption-step {
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        color: var(--teach);
+      }
+
+      .caption-title {
+        margin-top: 4px;
+        font-size: 14px;
+        font-weight: 600;
+        line-height: 1.35;
+        letter-spacing: -0.018em;
+      }
+
+      .caption-detail {
+        margin-top: 6px;
+        font-size: 12.5px;
+        line-height: 1.5;
+        color: #3c3c3e;
+      }
+
+      .caption-hint {
+        margin-top: 10px;
+        padding-top: 8px;
+        border-top: 1px solid var(--edge);
+        font-size: 11.5px;
+        color: var(--muted);
+      }
+
+      /* ---- Agent cursor (macOS style) ---------------------------------- */
+
+      /*
+       * The agent's own pointer. The user's real cursor stays where they left
+       * it; this one does the travelling, and the real one only visits the
+       * target for the instant of a click. Its tip is its hotspot, so the
+       * element is offset by the tip's position in the drawing.
+       */
+      .pointer {
+        position: fixed;
+        top: 0;
+        left: 0;
+        pointer-events: none;
+        z-index: 5;
+        will-change: transform;
+        /* Frames arrive every ~12ms; a short glide between them hides jitter. */
+        transition: transform 34ms linear;
+      }
+
+      /* Sits exactly on the hotspot; each drawing is offset by its own tip. */
+      .cursor-body {
+        position: absolute;
+        left: 0;
+        top: 0;
+        transform-origin: 0 0;
+        transition: transform 140ms cubic-bezier(0.3, 1.6, 0.5, 1);
+        animation: cursor-in 260ms cubic-bezier(0.2, 1.4, 0.4, 1);
+      }
+
+      @keyframes cursor-in {
+        from {
+          opacity: 0;
+          transform: scale(0.4);
+        }
+      }
+
+      .cursor-img {
+        position: absolute;
+        display: block;
+        transition: opacity 90ms ease;
+      }
+
+      /*
+       * The arrow is solid black with no edge of its own, so it would vanish
+       * on anything dark. Four hairline white shadows draw the outline macOS
+       * gives its pointer, and a soft one lifts it off the page. Its tip is
+       * at (5, 1) in the 24px drawing.
+       */
+      .cursor-arrow {
+        left: -5px;
+        top: -1px;
+        width: 24px;
+        height: 24px;
+        filter: drop-shadow(1px 0 0 #fff) drop-shadow(-1px 0 0 #fff) drop-shadow(0 1px 0 #fff)
+          drop-shadow(0 -1px 0 #fff) drop-shadow(0 2px 3px rgba(0, 0, 0, 0.45));
+      }
+
+      /*
+       * The pointing hand, shown as it clicks. The hand fills only half of its
+       * 32px drawing, so at 1.5x it matches the arrow's size; the fingertip,
+       * (13, 8) in the drawing, lands on the hotspot at (20, 12).
+       */
+      .cursor-hand {
+        left: -20px;
+        top: -12px;
+        width: 48px;
+        height: 48px;
+        opacity: 0;
+        filter: drop-shadow(0 2px 3px rgba(0, 0, 0, 0.4));
+      }
+
+      .pointer.hand .cursor-arrow {
+        opacity: 0;
+      }
+
+      .pointer.hand .cursor-hand {
+        opacity: 1;
+      }
+
+      /* Pressed: the arrow dips, like a finger going down on a trackpad. */
+      .pointer.press .cursor-body {
+        transform: scale(0.82);
+      }
+
+      .cursor-tag {
+        position: absolute;
+        left: 16px;
+        top: 22px;
+        display: flex;
+        align-items: center;
+        gap: 5px;
+        padding: 3px 9px;
+        border-radius: 999px;
+        background: var(--agent-gloss);
+        color: #fff;
+        font-size: 11.5px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+        white-space: nowrap;
+        text-shadow: 0 1px 1px rgba(0, 0, 0, 0.25);
+        box-shadow:
+          0 4px 12px rgba(255, 23, 68, 0.35),
+          inset 0 1px 1px rgba(255, 255, 255, 0.45);
+      }
+
+      /* Near the right or bottom edge the tag would leave the screen, so it
+         swings to the other side of the pointer, as the Teach caption does. */
+      .pointer[data-flip-x='true'] .cursor-tag {
+        left: auto;
+        right: 14px;
+      }
+
+      .pointer[data-flip-y='true'] .cursor-tag {
+        top: auto;
+        bottom: 12px;
+      }
+
+      .cursor-state:empty {
+        display: none;
+      }
+
+      .cursor-state {
+        font-weight: 500;
+        opacity: 0.9;
+      }
+
+      .cursor-state::before {
+        content: '·';
+        margin-right: 5px;
+      }
+
+      /* Typing: the note breathes, so it reads as busy rather than stuck. */
+      .pointer.typing .cursor-state {
+        animation: busy 900ms ease-in-out infinite;
+      }
+
+      @keyframes busy {
+        50% {
+          opacity: 0.45;
+        }
+      }
+
+      body[data-paused='true'] .cursor-tag {
+        background: #8a8a8e;
+        box-shadow: none;
+      }
+
+      /* ---- Approval card ------------------------------------------------ */
+
+      /*
+       * Sits directly under the banner, in the same plate-and-pill language,
+       * because it is the banner's question: the agent has stopped and is
+       * waiting on one decision. Nothing else on the overlay takes clicks.
+       */
+      .approval {
+        position: fixed;
+        top: 66px;
+        left: 50%;
+        transform: translateX(-50%);
+        width: min(460px, 90vw);
+        padding: 16px 18px 14px;
+        border: 1px solid rgba(255, 69, 105, 0.35);
+        border-radius: 18px;
+        background: var(--plate);
+        backdrop-filter: blur(20px) saturate(180%);
+        color: var(--ink);
+        box-shadow:
+          0 18px 44px rgba(0, 0, 0, 0.32),
+          0 0 0 4px rgba(255, 23, 68, 0.1),
+          inset 0 1px 1px var(--hi);
+        animation: approval-in 220ms cubic-bezier(0.2, 0.8, 0.25, 1);
+        user-select: text;
+        -webkit-user-select: text;
+      }
+
+      .approval[hidden] {
+        display: none;
+      }
+
+      @keyframes approval-in {
+        from {
+          opacity: 0;
+          transform: translate(-50%, -8px) scale(0.98);
+        }
+      }
+
+      .approval-label {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+        color: var(--agent-deep);
+      }
+
+      .approval-title {
+        margin-top: 8px;
+        font-size: 16px;
+        font-weight: 600;
+        line-height: 1.3;
+        letter-spacing: -0.02em;
+      }
+
+      .approval-task {
+        margin-top: 4px;
+        font-size: 12.5px;
+        color: var(--muted);
+      }
+
+      .approval-text {
+        margin-top: 10px;
+        max-height: 150px;
+        overflow: auto;
+        padding: 10px 12px;
+        border: 1px solid var(--edge);
+        border-radius: 12px;
+        background: rgba(255, 255, 255, 0.8);
+        font-size: 12.5px;
+        line-height: 1.5;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+
+      /* A long email preview scrolls; a thin pill, not Windows' grey arrows. */
+      .approval-text::-webkit-scrollbar {
+        width: 10px;
+      }
+
+      .approval-text::-webkit-scrollbar-track {
+        background: transparent;
+      }
+
+      .approval-text::-webkit-scrollbar-thumb {
+        border: 3px solid transparent;
+        border-radius: 999px;
+        background-color: rgba(0, 0, 0, 0.18);
+        background-clip: padding-box;
+      }
+
+      .approval-text::-webkit-scrollbar-thumb:hover {
+        background-color: rgba(0, 0, 0, 0.32);
+      }
+
+      .approval-text[hidden] {
+        display: none;
+      }
+
+      .approval-change {
+        display: block;
+        box-sizing: border-box;
+        width: 100%;
+        margin-top: 12px;
+        padding: 9px 14px;
+        border: 1px solid var(--edge);
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.9);
+        color: var(--ink);
+        font: inherit;
+        font-size: 13px;
+        outline: none;
+        box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.06);
+        transition:
+          border-color 120ms ease,
+          box-shadow 120ms ease;
+      }
+
+      .approval-change:focus {
+        border-color: rgba(255, 69, 105, 0.55);
+        box-shadow:
+          inset 0 1px 2px rgba(0, 0, 0, 0.06),
+          0 0 0 3px rgba(255, 23, 68, 0.12);
+      }
+
+      .approval-change[hidden],
+      .approval .change[hidden] {
+        display: none;
+      }
+
+      .approval .change {
+        border: 1px solid rgba(255, 69, 105, 0.45);
+        background: linear-gradient(#fff 0%, #fbeeee 100%);
+        color: var(--agent-deep);
+        box-shadow: inset 0 1px 1px var(--hi);
+      }
+
+      .approval .change:disabled {
+        opacity: 0.45;
+        cursor: default;
+      }
+
+      .approval-actions {
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        gap: 8px;
+        margin-top: 14px;
+      }
+
+      .approval-hint {
+        margin-right: auto;
+        font-size: 11.5px;
+        color: var(--muted);
+      }
+
+      .approval button {
+        padding: 7px 16px;
+        border-radius: 999px;
+        font: inherit;
+        font-size: 13px;
+        font-weight: 600;
+        cursor: pointer;
+        transition:
+          transform 120ms ease,
+          filter 120ms ease;
+      }
+
+      .approval button:active {
+        transform: scale(0.97);
+      }
+
+      .approval .stop {
+        border: 1px solid var(--edge);
+        background: linear-gradient(#fff 0%, #ededed 100%);
+        color: var(--ink);
+        box-shadow: inset 0 1px 1px var(--hi);
+      }
+
+      .approval .allow {
+        border: 1px solid var(--agent-deep);
+        background: var(--agent-gloss);
+        color: #fff;
+        text-shadow: 0 1px 1px rgba(0, 0, 0, 0.25);
+        box-shadow:
+          0 4px 12px rgba(255, 23, 68, 0.35),
+          inset 0 1px 1px rgba(255, 255, 255, 0.45);
+      }
+
+      .approval .allow:hover,
+      .approval .stop:hover {
+        filter: brightness(1.05);
+      }
+
+      /* While waiting, the frame stops pulsing: nothing is moving. */
+      body[data-approval='true'] .frame {
+        animation: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="frame"></div>
+    <div class="banner">
+      <span class="dot"></span>
+      <button class="todo-pill" id="todo-pill" type="button" hidden aria-expanded="false" title="Show the to-do list">
+        <span class="todo-pill-box" aria-hidden="true"></span>
+        <span id="todo-count">0/0</span>
+        <span class="todo-chev" aria-hidden="true">▾</span>
+      </button>
+      <span id="action">RYNOX is controlling your PC</span>
+      <span class="step" id="step"></span>
+      <span class="step">— hold <kbd>Esc</kbd> to stop</span>
+    </div>
+    <div class="todo-card" id="todo-card" hidden>
+      <div class="todo-head">
+        <span>To-do</span>
+        <span class="todo-summary" id="todo-summary"></span>
+      </div>
+      <div class="todo-bar"><div class="todo-bar-fill" id="todo-bar-fill"></div></div>
+      <ol class="todo-list" id="todo-list"></ol>
+    </div>
+    <div class="approval" id="approval" hidden>
+      <div class="approval-label"><span class="dot"></span>Needs your OK</div>
+      <div class="approval-title" id="approval-title"></div>
+      <div class="approval-task" id="approval-task"></div>
+      <div class="approval-text" id="approval-text" hidden></div>
+      <input
+        class="approval-change"
+        id="approval-note"
+        type="text"
+        placeholder="Change something first? e.g. make the subject &quot;Today's top 5 news&quot;"
+        autocomplete="off"
+        spellcheck="true"
+      />
+      <div class="approval-actions">
+        <span class="approval-hint">Nothing happens until you choose</span>
+        <button class="stop" id="approval-stop" type="button">Stop task</button>
+        <button class="change" id="approval-change" type="button" disabled>Change</button>
+        <button class="allow" id="approval-allow" type="button">Allow</button>
+      </div>
+    </div>
+    <div class="pointer" id="pointer" hidden>
+      <div class="cursor-body">
+        <img class="cursor-img cursor-arrow" src="./assets/cursor-arrow.png" alt="" />
+        <img class="cursor-img cursor-hand" src="./assets/cursor-hand.png" alt="" />
+        <span class="cursor-tag"><span class="cursor-name">RYNOX</span><span class="cursor-state" id="cursor-state"></span></span>
+      </div>
+    </div>
+    <div class="ghost" id="ghost" hidden>
+      <div class="ghost-ping"></div>
+      <img class="ghost-arrow" src="./assets/cursor-hand.png" alt="" />
+      <div class="caption">
+        <div class="caption-step" id="caption-step"></div>
+        <div class="caption-title" id="caption-title"></div>
+        <div class="caption-detail" id="caption-detail"></div>
+        <div class="caption-hint" id="caption-hint"></div>
+      </div>
+    </div>
+    <script type="module" src="./src/overlay.ts"></script>
+  </body>
+</html>

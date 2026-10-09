@@ -1,0 +1,731 @@
+import { hasReadyKey, isKeyReady, poolSize, restAfterRefusal, secondsUntilReady, takeKey } from '../geminiKeys'
+
+export const GEMINI_ENDPOINT = 'https://generativelanguage.googleapis.com/v1beta/models'
+
+export interface GeminiPart {
+  text?: string
+  thought?: boolean
+  functionCall?: { name: string; args: Record<string, unknown> }
+}
+
+export interface GeminiResponse {
+  candidates?: {
+    content?: { parts?: GeminiPart[] }
+    finishReason?: string
+    /** Present when Google Search grounded the answer: the pages it read. */
+    groundingMetadata?: unknown
+  }[]
+  error?: { message?: string }
+}
+
+/**
+ * How hard the model should think before answering.
+ *
+ * Left unset for Talk Mode, where the answer is the product. Agent and Teach
+ * steps are the opposite: "which control do I point at next" is perception, and
+ * deliberating over it costs seconds per step on a task that takes a dozen.
+ */
+export type ThinkingLevel = 'low' | 'high'
+
+/**
+ * Models known to reject `thinkingConfig`, so the hint is offered once.
+ *
+ * Without this the retry below fires on every single call: Agent Mode makes a
+ * dozen of them per task, so a model that does not understand the hint was
+ * costing two HTTP round trips and two of a twenty-a-day quota for every step,
+ * and thinking at full depth anyway. The streaming path has always remembered
+ * its own failure this way; this one had been left to relearn it forever.
+ */
+const thinkingSupport = new Map<string, boolean>()
+
+/**
+ * The thinking hint in the dialect this model speaks.
+ *
+ * Gemini 3 takes `thinkingLevel`; the 2.5 family only understands
+ * `thinkingBudget` and rejects the other with a 400. Sending the wrong one cost
+ * a failed request per model and left 2.5 Flash thinking at full depth on every
+ * agent step. 2.5 Pro cannot switch thinking off, so its floor is 128.
+ */
+export function thinkingConfigFor(model: string, level: ThinkingLevel): Record<string, unknown> {
+  if (/gemini-2\.5/i.test(model)) {
+    if (level === 'high') return { thinkingBudget: -1 }
+    return { thinkingBudget: /pro/i.test(model) ? 128 : 0 }
+  }
+  return { thinkingLevel: level }
+}
+
+/** Merges a thinking hint into the request without disturbing the rest of it. */
+function withThinking(body: unknown, model: string, level: ThinkingLevel): unknown {
+  const request = body as { generationConfig?: Record<string, unknown> }
+  return {
+    ...(request as object),
+    generationConfig: {
+      ...(request.generationConfig ?? {}),
+      thinkingConfig: thinkingConfigFor(model, level)
+    }
+  }
+}
+
+/**
+ * A 503 from Gemini means "busy, come back" - it is the one status where
+ * trying again is the correct response rather than a hopeful one. Two extra
+ * attempts, backing off, because the alternative is handing the user an error
+ * for something that would have worked a second later.
+ */
+const OVERLOAD_RETRIES = 2
+const OVERLOAD_BACKOFF_MS = [700, 1600]
+
+/**
+ * How long a model that answered 503 is left alone.
+ *
+ * Without this the retries become the problem they were meant to solve. While
+ * a model is down, every request pays three failed round trips and 2.3
+ * seconds of backoff before falling back - on every transcription, every agent
+ * step. Learning it once and going straight to the model that works is the
+ * difference between a slow feature and a broken one.
+ *
+ * A minute, because being overloaded is a passing state and this must not
+ * strand someone on a slower model after Google recovers.
+ */
+const OVERLOAD_COOLDOWN_MS = 60_000
+
+/**
+ * Each further refusal rests a model longer, up to a quarter of an hour.
+ *
+ * A minute is right for a passing spike. It is wrong for the afternoon Google
+ * spends degraded, where it means re-discovering the same outage every single
+ * minute, at ten seconds a time, for as long as it lasts. Backing off spends
+ * that once and then leaves it alone - while still coming back on its own,
+ * which is the whole reason not to drop a model permanently.
+ */
+const COOLDOWN_CEILING_MS = 15 * 60_000
+
+/**
+ * How long to wait for a model to START answering.
+ *
+ * There was no limit at all, which is worse than a slow answer: a model that
+ * hangs holds the whole task until the user presses Escape, and two were
+ * measured hanging past 20 seconds with nothing at all.
+ *
+ * This is a deadline on the response arriving, not on the answer finishing -
+ * the timer is cleared the moment headers come back, so a long reply is never
+ * cut off halfway.
+ *
+ * Generous, because headers do not come back until the request has finished
+ * uploading. A voice clip is most of a megabyte of audio; ten seconds looked
+ * ample against a "hi" and then timed out every model in the chain on a real
+ * transcription, turning a working fallback into a slower way to fail.
+ */
+const REQUEST_TIMEOUT_MS = 25_000
+
+/**
+ * Agent and Teach steps send one small screenshot and ask one small question,
+ * a dozen times a task. Waiting 25 seconds on each of those is its own
+ * failure, so they set their own, shorter deadline.
+ *
+ * Not too short, though: generateContent only sends headers once the whole
+ * answer is written, so this covers the screenshot upload plus the reply. At
+ * seven seconds a slow network timed out every model in the chain in turn.
+ */
+export const STEP_TIMEOUT_MS = 15_000
+
+/** When each model is worth trying again. Keyed by model id. */
+const restingUntil = new Map<string, number>()
+/** How long the last rest was, so the next one can be longer. */
+const restLength = new Map<string, number>()
+/** Models returned by Google's model list, cached briefly per API key. */
+const discoveredModels = new Map<string, { expires: number; models: string[] }>()
+
+/**
+ * Puts models that are known to be up ahead of ones that just refused.
+ *
+ * If every candidate is resting the original order is kept: something has to
+ * be tried, and a stale cooldown is a worse reason to fail than a real 503.
+ */
+export function preferAvailable(
+  candidates: string[],
+  resting: Map<string, number>,
+  now: number
+): string[] {
+  const ready = candidates.filter((model) => (resting.get(model) ?? 0) <= now)
+  if (ready.length > 0) return ready
+
+  // Everything is resting, so Google is having a bad minute and none of these
+  // is going to answer. Walking the whole chain again would spend the deadline
+  // once per model to reach the same conclusion - a minute of waiting to be
+  // told what the first ten seconds already established. Try the one closest
+  // to being worth another go, and report quickly.
+  const soonest = [...candidates].sort(
+    (a, b) => (resting.get(a) ?? 0) - (resting.get(b) ?? 0)
+  )
+  return soonest.slice(0, 1)
+}
+
+function pause(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(done, ms)
+    function done(): void {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', done)
+      resolve()
+    }
+    signal?.addEventListener('abort', done, { once: true })
+  })
+}
+
+export async function callGemini(options: {
+  apiKey: string
+  model: string
+  method: 'generateContent' | 'streamGenerateContent'
+  body: unknown
+  signal?: AbortSignal
+  thinking?: ThinkingLevel
+  /**
+   * Models to try when the chosen one is overloaded, in order.
+   *
+   * Only for models the user did not choose - the fast one behind Agent, Teach
+   * and voice. Retrying does not help when a model is refusing everyone, and
+   * failing the task while another model on the same key would have answered
+   * is a worse outcome than a slower answer. Talk Mode deliberately passes
+   * nothing here: someone who picked a model with "/aimodel" should not get a
+   * silent substitute answering in its place.
+   *
+   * Free-tier quota is counted per model, so this also buys a second
+   * allowance on the day the first runs out.
+   */
+  fallbackModels?: string[]
+  /** Told which model answered - so a substitution can be admitted, not hidden. */
+  onModelChosen?: (model: string) => void
+  /** Overrides the default deadline. Small, frequent calls should ask for less. */
+  timeoutMs?: number
+  /**
+   * Try this key first instead of the pool's first ready one. Parallel SOP
+   * writers each pin their own key - otherwise every one of them would take
+   * key #1 and the other keys would sit idle. Falls back to the pool if it is
+   * refused.
+   */
+  preferKey?: string
+}): Promise<Response> {
+  const candidates = preferAvailable(
+    modelCandidates(options.model, options.fallbackModels),
+    restingUntil,
+    Date.now()
+  )
+
+  let response = await attempt(candidates[0]!, { ...options, hasAlternatives: candidates.length > 1 })
+  noteAvailability(candidates[0]!, response.status)
+  if (response.ok) options.onModelChosen?.(candidates[0]!)
+
+  // Move down the chain on anything another model could fix: busy (503), an
+  // id this key cannot use (404), or this model's daily quota spent (429 -
+  // free-tier quota is per model, so the next one has its own allowance).
+  for (let next = 1; shouldTryAnotherModel(response.status) && next < candidates.length; next++) {
+    if (options.signal?.aborted) return response
+    response = await attempt(candidates[next]!, {
+      ...options,
+      hasAlternatives: next < candidates.length - 1
+    })
+    noteAvailability(candidates[next]!, response.status)
+    if (response.ok) options.onModelChosen?.(candidates[next]!)
+  }
+
+  // Model ids change and access varies by API key. If every configured id is
+  // rejected as unknown, ask Google what this key can actually use instead of
+  // making the user guess another model name.
+  if (response.status === 404 && !options.signal?.aborted) {
+    const available = await listAvailableModels(options.apiKey, options.signal)
+    const replacement = pickReplacement(available, candidates)
+    if (replacement) {
+      const retried = await attempt(replacement, { ...options, hasAlternatives: false })
+      noteAvailability(replacement, retried.status)
+      if (retried.ok) options.onModelChosen?.(replacement)
+      if (retried.ok || retried.status !== 404) return retried
+    }
+  }
+  return response
+}
+
+function shouldTryAnotherModel(status: number): boolean {
+  return status === 503 || status === 404 || status === 429
+}
+
+/**
+ * The best stand-in from Google's model list.
+ *
+ * The list includes TTS, image-generation, live-audio and embedding variants
+ * that accept generateContent but cannot read a screenshot. Taking the first
+ * entry blindly could land on one of those.
+ */
+export function pickReplacement(available: string[], exclude: string[]): string | null {
+  const usable = available.filter(
+    (model) =>
+      !exclude.includes(model) &&
+      /^gemini-/i.test(model) &&
+      !/tts|image|live|audio|embedding|thinking-exp|robotics|computer-use/i.test(model)
+  )
+  return (
+    usable.find((model) => /flash/i.test(model) && !/preview|exp/i.test(model)) ??
+    usable.find((model) => /flash/i.test(model)) ??
+    usable[0] ??
+    null
+  )
+}
+
+async function listAvailableModels(apiKey: string, signal?: AbortSignal): Promise<string[]> {
+  const cached = discoveredModels.get(apiKey)
+  if (cached && cached.expires > Date.now()) return cached.models
+
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 4_000)
+  const requestSignal = signal
+    ? AbortSignal.any([signal, controller.signal])
+    : controller.signal
+
+  try {
+    const response = await fetch(GEMINI_ENDPOINT, {
+      headers: { 'x-goog-api-key': apiKey },
+      signal: requestSignal
+    })
+    if (!response.ok) return []
+
+    const payload = (await response.json()) as {
+      models?: { name?: string; supportedGenerationMethods?: string[] }[]
+    }
+    const models = (payload.models ?? [])
+      .filter((model) => model.supportedGenerationMethods?.includes('generateContent'))
+      .map((model) => model.name?.replace(/^models\//, '') ?? '')
+      .filter(Boolean)
+    discoveredModels.set(apiKey, { expires: Date.now() + 10 * 60_000, models })
+    return models
+  } catch {
+    return []
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** Remembers which models are refusing, so the next call skips them. */
+function noteAvailability(model: string, status: number): void {
+  if (status !== 503) {
+    // Answering clears the record entirely: a model that is back should get
+    // the short cooldown again if it stumbles later, not the long one it
+    // earned during an outage that is over.
+    restingUntil.delete(model)
+    restLength.delete(model)
+    return
+  }
+
+  const rest = Math.min(
+    COOLDOWN_CEILING_MS,
+    (restLength.get(model) ?? OVERLOAD_COOLDOWN_MS / 2) * 2
+  )
+  restLength.set(model, rest)
+  restingUntil.set(model, Date.now() + rest)
+}
+
+/** Exported for tests: the rest a model has earned after this many refusals. */
+export function cooldownAfter(failures: number): number {
+  let rest = OVERLOAD_COOLDOWN_MS / 2
+  for (let n = 0; n < failures; n++) rest = Math.min(COOLDOWN_CEILING_MS, rest * 2)
+  return rest
+}
+
+/**
+ * The models to try, in order, first choice first.
+ *
+ * Blanks and repeats are dropped: settings can legitimately hold the same id
+ * for the quick model and the Talk model, and trying it twice would double the
+ * wait before reporting a failure that was already decided.
+ */
+export function modelCandidates(model: string, fallbacks: string[] = []): string[] {
+  const seen: string[] = []
+  for (const name of [model, ...fallbacks]) {
+    if (name && !seen.includes(name)) seen.push(name)
+  }
+  return seen
+}
+
+async function attempt(
+  model: string,
+  options: {
+    apiKey: string
+    method: 'generateContent' | 'streamGenerateContent'
+    body: unknown
+    signal?: AbortSignal
+    thinking?: ThinkingLevel
+    /** True when another model is queued behind this one. */
+    hasAlternatives?: boolean
+    timeoutMs?: number
+    preferKey?: string
+  }
+): Promise<Response> {
+  const query = options.method === 'streamGenerateContent' ? '?alt=sse' : ''
+  const url = `${GEMINI_ENDPOINT}/${model}:${options.method}${query}`
+
+  const send = async (body: unknown, key: string): Promise<Response> => {
+    // The caller's cancellation and our own deadline both have to reach fetch,
+    // and only one of them means the user changed their mind.
+    const deadline = new AbortController()
+    const timer = setTimeout(() => deadline.abort(), options.timeoutMs ?? REQUEST_TIMEOUT_MS)
+    const signal = options.signal
+      ? AbortSignal.any([options.signal, deadline.signal])
+      : deadline.signal
+
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        signal,
+        headers: { 'content-type': 'application/json', 'x-goog-api-key': key },
+        body: JSON.stringify(body)
+      })
+      // Headers are back, so the model is alive. Everything after this is it
+      // writing the answer, which is allowed to take as long as it takes -
+      // leaving the timer armed would cut a long reply off mid-sentence.
+      clearTimeout(timer)
+      return response
+    } catch (error) {
+      // A user pressing Escape is a real abort and must propagate.
+      if (options.signal?.aborted) throw error
+      if (!deadline.signal.aborted) {
+        // Node's fetch rejects before Gemini can return an HTTP response for
+        // offline, DNS, TLS and proxy failures. Keep that distinct from a
+        // model overload so the user gets useful recovery advice.
+        return new Response(null, {
+          status: 503,
+          headers: { 'x-argus-network-error': '1' }
+        })
+      }
+
+      // Our own deadline. A model that will not answer is unavailable, which
+      // is what 503 means - so it takes the same path and the next model in
+      // the chain gets a turn.
+      return new Response(null, { status: 503, headers: { 'x-argus-timeout': '1' } })
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  // Retries only the "server is busy" case. A refused key, a bad model or a
+  // spent quota are all answers, and asking again does not change them.
+  //
+  // And only when this is the last resort. With other models to try, asking a
+  // busy one three times is three waits before reaching the one that would
+  // have answered immediately - the cooldown will keep this model out of the
+  // way afterwards either way.
+  const retries = options.hasAlternatives ? 0 : OVERLOAD_RETRIES
+  const post = async (body: unknown, key: string): Promise<Response> => {
+    let response = await send(body, key)
+    for (let retry = 0; response.status === 503 && retry < retries; retry++) {
+      if (options.signal?.aborted) return response
+      await pause(OVERLOAD_BACKOFF_MS[retry] ?? 1600, options.signal)
+      if (options.signal?.aborted) return response
+      response = await send(body, key)
+    }
+    return response
+  }
+
+  const wantsThinking = Boolean(options.thinking) && thinkingSupport.get(model) !== false
+  const body = wantsThinking ? withThinking(options.body, model, options.thinking!) : options.body
+
+  // One attempt per key. A refused key is rested and the next one picked up,
+  // so a quota that runs out mid-task does not end the task.
+  for (let attempt = 0; attempt < Math.max(1, poolSize()); attempt++) {
+    const pinned = attempt === 0 && options.preferKey && isKeyReady(options.preferKey)
+    const key = pinned ? options.preferKey! : (takeKey() ?? options.apiKey)
+    const response = await post(body, key)
+
+    // 429 is a quota window that reopens; 401/403 is a key that never will.
+    // Either way another key may work, and one bad key in the pool must not
+    // fail a request that a good one could have served.
+    if (response.status === 429 || response.status === 401 || response.status === 403) {
+      const detail = await peek(response)
+      restAfterRefusal(key, detail, response.status)
+      if (hasReadyKey()) continue
+      return response
+    }
+
+    // Gemini rejects a bad key with 400 API_KEY_INVALID, not 401. Treated the
+    // same way, so one mistyped key does not fail every request in the pool.
+    if (response.status === 400) {
+      const detail = await peek(response)
+      if (/API_KEY_INVALID|api key not valid/i.test(detail)) {
+        restAfterRefusal(key, detail, 401)
+        if (hasReadyKey()) continue
+        return response
+      }
+    }
+
+    // thinkingConfig is not understood by every model. It is a speed hint, so
+    // a model that rejects it should still run the task - just slower. Noted,
+    // so this costs one wasted request per model rather than one per step.
+    if (response.status === 400 && wantsThinking) {
+      const detail = await peek(response)
+      if (/thinking/i.test(detail)) {
+        thinkingSupport.set(model, false)
+        return await post(options.body, key)
+      }
+    }
+
+    if (response.ok && wantsThinking) thinkingSupport.set(model, true)
+
+    return response
+  }
+
+  return await post(body, options.apiKey)
+}
+
+/** Reads an error body without consuming the response the caller may still need. */
+async function peek(response: Response): Promise<string> {
+  try {
+    return JSON.stringify((await response.clone().json()) as GeminiResponse)
+  } catch {
+    return ''
+  }
+}
+
+/** Seconds until any key is usable again - for the message shown on failure. */
+export function retryAdviceSeconds(): number {
+  return secondsUntilReady()
+}
+
+/**
+ * Strips screenshots from every turn but the newest.
+ *
+ * The history was accumulating one full screenshot per step, so step 10 re-sent
+ * ten of them - roughly 1,100 prompt tokens each, growing the request every
+ * turn and eating a free-tier rate limit that is counted per request AND per
+ * token. Only the current screen matters for the next decision; what happened
+ * before it is already in the function-call history as text.
+ */
+export function dropStaleImages(contents: { role: string; parts: unknown[] }[]): void {
+  for (let index = 0; index < contents.length - 1; index++) {
+    const turn = contents[index]
+    if (!turn) continue
+    turn.parts = turn.parts.map((part) =>
+      part && typeof part === 'object' && 'inline_data' in part
+        ? { text: '[earlier screenshot omitted - see the current one]' }
+        : part
+    )
+  }
+}
+
+export async function describeGeminiFailure(response: Response, model: string): Promise<string> {
+  let detail = ''
+  try {
+    detail = ((await response.json()) as GeminiResponse).error?.message ?? ''
+  } catch {
+    // Non-JSON error body - the status alone will have to do.
+  }
+
+  if ((response.status === 400 && /api key/i.test(detail)) || response.status === 401) {
+    return 'Every Gemini key was rejected. Check them with "/keys", then add a working one with "/key <your-key>".'
+  }
+  if (response.status === 404) {
+    return `Gemini has no model "${model}" available to this key. Switch with "/model <model-id>".`
+  }
+  if (response.status === 429) {
+    const wait = retryAdviceSeconds()
+    const when = wait > 90 ? `about ${Math.round(wait / 60)} min` : `${wait || 30}s`
+    return `Every Gemini key is over quota (the free tier allows 20 requests a day per model). Try again in ${when}, or add another key with "/key <your-key>".`
+  }
+  if (response.headers.get('x-argus-timeout')) {
+    return (
+      'Gemini is responding slowly right now, on Google’s side - I retried and tried backup models. ' +
+      'I stopped where I was. Give it a few seconds and ask again.'
+    )
+  }
+  if (response.headers.get('x-argus-network-error')) {
+    return (
+      'Could not reach Gemini. Check your internet connection, VPN or proxy, then try again. ' +
+      'If other apps also cannot connect, fix the network before changing your API key.'
+    )
+  }
+  if (response.status === 503) {
+    // Already retried three times by the time this is written, so "try again"
+    // on its own would be poor advice - name the way out as well. Talk and the
+    // Agent/Teach/voice model are set by different commands, and pointing at
+    // the wrong one is how someone changes a setting that was never involved.
+    return (
+      `Google’s Gemini servers are busy right now ("${model}" and its backups) - I retried several times. ` +
+      'Give it a few seconds and ask again, or switch model with "/aimodel".'
+    )
+  }
+  return `Gemini API error ${response.status}${detail ? `: ${detail}` : ''}`
+}
+
+/**
+ * Pulls the answer out of one Gemini payload.
+ *
+ * Shared by every text-producing caller here, so a reasoning part leaking into
+ * a visible answer is a bug that can only exist in one place.
+ */
+export function extractText(payload: unknown, trim = true): string {
+  const response = payload as GeminiResponse
+  if (response.error?.message) throw new Error(`Gemini: ${response.error.message}`)
+  const text = (response.candidates?.[0]?.content?.parts ?? [])
+    .filter((part) => !part.thought && part.text) // reasoning parts stay internal
+    .map((part) => part.text)
+    .join('')
+  return trim ? text.trim() : text
+}
+
+/** Longest a single agent or teach step may take, start to finish. */
+const STEP_TOTAL_MS = 90_000
+/** Waits before retrying a step that failed for a reason that passes. */
+const STEP_RETRY_WAITS_MS = [1500, 3500]
+
+/** Failures that are about the moment, not the request - worth one more go. */
+function isTransient(message: string): boolean {
+  return /overloaded|unavailable|internal|deadline|timeout|timed out|terminated|fetch failed|network|socket|ECONN|503|500|slowly|busy/i.test(
+    message
+  )
+}
+
+/**
+ * One agent or teach step: streamed, capped, and retried.
+ *
+ * A step failing because Google had a slow second should not end a task the
+ * user is watching. Transient failures are retried twice, with a pause, after
+ * `callGemini` has already walked the fallback models. Anything that another
+ * try cannot fix - a bad key, a spent quota, a malformed request - is
+ * reported at once.
+ */
+export async function requestStep(
+  options: Omit<Parameters<typeof callGemini>[0], 'method'> & {
+    /** Told before each retry, so the overlay can say what is happening. */
+    onRetry?: (attempt: number, of: number) => void
+  }
+): Promise<GeminiResponse> {
+  const { onRetry, ...request } = options
+
+  for (let attempt = 0; ; attempt++) {
+    const cap = new AbortController()
+    const timer = setTimeout(() => cap.abort(), STEP_TOTAL_MS)
+    const signal = request.signal ? AbortSignal.any([request.signal, cap.signal]) : cap.signal
+
+    let failure: string
+    let transient: boolean
+    try {
+      const response = await callGemini({ ...request, method: 'streamGenerateContent', signal })
+      if (response.ok && response.body) return await collectStream(response.body)
+      failure = await describeGeminiFailure(response, request.model)
+      transient = response.status === 503
+    } catch (error) {
+      if (request.signal?.aborted) throw error
+      failure = cap.signal.aborted
+        ? 'Gemini took too long to answer this step.'
+        : error instanceof Error
+          ? error.message
+          : String(error)
+      transient = cap.signal.aborted || isTransient(failure)
+    } finally {
+      clearTimeout(timer)
+    }
+
+    if (!transient || attempt >= STEP_RETRY_WAITS_MS.length) throw new Error(failure)
+    onRetry?.(attempt + 1, STEP_RETRY_WAITS_MS.length)
+    await pause(STEP_RETRY_WAITS_MS[attempt]!, request.signal)
+    if (request.signal?.aborted) throw new Error('Stopped.')
+  }
+}
+
+/**
+ * Reads a whole streamed response back into the shape `generateContent` gives.
+ *
+ * Why agent and teach steps stream at all: the plain call sends no headers
+ * until the answer is finished, so its deadline had to cover the entire
+ * answer. That was fine for "click at 400,300" and fatal for a step that
+ * writes a whole email in one go - every model in the chain timed out on the
+ * same long answer and the task died with "every model was silent". Streamed,
+ * the deadline only has to cover the model starting to answer.
+ *
+ * Parts are kept as returned (a function call and its thoughtSignature must be
+ * echoed back verbatim); only consecutive plain text fragments are joined.
+ */
+export async function collectStream(body: ReadableStream<Uint8Array>): Promise<GeminiResponse> {
+  const parts: (GeminiPart & Record<string, unknown>)[] = []
+  let finishReason: string | undefined
+  // Arrives on the last chunk when Search was used. Kept, because the pages a
+  // researched answer came from are what let the user check it.
+  let groundingMetadata: unknown
+
+  for await (const event of readServerSentEvents(body)) {
+    if (!event) continue
+    const payload = JSON.parse(event) as GeminiResponse
+    if (payload.error?.message) throw new Error(`Gemini: ${payload.error.message}`)
+
+    const candidate = payload.candidates?.[0]
+    for (const part of (candidate?.content?.parts ?? []) as (GeminiPart & Record<string, unknown>)[]) {
+      const last = parts[parts.length - 1]
+      const plainText = (one: GeminiPart & Record<string, unknown>): boolean =>
+        typeof one.text === 'string' && !one.functionCall && !('thoughtSignature' in one)
+      if (last && plainText(part) && typeof last.text === 'string' && !last.functionCall &&
+        Boolean(last.thought) === Boolean(part.thought)) {
+        last.text += part.text!
+        continue
+      }
+      parts.push({ ...part })
+    }
+    finishReason = candidate?.finishReason ?? finishReason
+    groundingMetadata = candidate?.groundingMetadata ?? groundingMetadata
+  }
+
+  return {
+    candidates: [
+      {
+        content: { parts },
+        ...(finishReason ? { finishReason } : {}),
+        ...(groundingMetadata ? { groundingMetadata } : {})
+      }
+    ]
+  }
+}
+
+/** Reads a streamed answer, reporting each chunk as it lands. */
+export async function consumeStream(
+  body: ReadableStream<Uint8Array>,
+  onDelta: (text: string) => void
+): Promise<string> {
+  let answer = ''
+  for await (const event of readServerSentEvents(body)) {
+    // Preserve whitespace between deltas; only trim once the full answer is
+    // assembled.
+    const text = extractText(JSON.parse(event), false)
+    if (!text) continue
+    answer += text
+    onDelta(text)
+  }
+  return answer.trim()
+}
+
+/** Yields the JSON payload of each `data:` event in an SSE stream. */
+async function* readServerSentEvents(body: ReadableStream<Uint8Array>): AsyncGenerator<string> {
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  for await (const bytes of body as unknown as AsyncIterable<Uint8Array>) {
+    // Gemini separates events with CRLF pairs; dropping CR lets one
+    // delimiter check cover both CRLF and LF streams.
+    buffer += decoder.decode(bytes, { stream: true }).replace(/\r/g, '')
+
+    let boundary = buffer.indexOf('\n\n')
+    while (boundary !== -1) {
+      const event = buffer.slice(0, boundary)
+      buffer = buffer.slice(boundary + 2)
+      boundary = buffer.indexOf('\n\n')
+
+      for (const line of event.split('\n')) {
+        if (line.startsWith('data:')) yield line.slice(5).trim()
+      }
+    }
+  }
+
+  // Flush a partial UTF-8 sequence and accept the final event even when the
+  // stream closes without the optional trailing blank line.
+  buffer += decoder.decode().replace(/\r/g, '')
+  if (buffer) {
+    for (const line of buffer.split('\n')) {
+      if (line.startsWith('data:')) yield line.slice(5).trim()
+    }
+  }
+}

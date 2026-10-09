@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!--
+      blob: is for the AudioWorklet module, which is built from an inline string.
+      A real file cannot be used: under file:// in the packaged build the path
+      does not resolve the way it does against the dev server.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' blob:; media-src 'self' blob:"
+    />
+    <title>RYNOX</title>
+    <link rel="stylesheet" href="./src/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell" id="app-shell">
+      <aside class="sidebar" id="sidebar" aria-label="RYNOX sidebar">
+        <div class="brand-block">
+          <img class="brand-mark" src="./assets/rynox-symbol.png" alt="" />
+          <div class="brand-copy">
+            <span>RYNOX</span>
+            <small>Desktop AI</small>
+          </div>
+        </div>
+
+        <button class="cta-button" id="new-chat" type="button" title="Start a new chat">
+          New Chat
+        </button>
+
+        <div class="sidebar-section">
+          <div class="sidebar-label">History</div>
+          <ul class="history-list" id="history-list" aria-live="polite"></ul>
+        </div>
+
+        <button class="sidebar-item" id="workflows" type="button">
+          Saved Workflows
+        </button>
+
+        <button
+          class="sidebar-toggle"
+          id="sidebar-toggle"
+          type="button"
+          aria-label="Collapse sidebar"
+          aria-expanded="true"
+          title="Collapse sidebar"
+        >
+          Collapse
+        </button>
+      </aside>
+
+      <main class="bar" id="bar">
+        <div class="row">
+          <span class="grip" title="Drag to move"></span>
+          <button
+            class="chip"
+            id="chip"
+            type="button"
+            data-mode="agent"
+            title="Switch between asking and acting"
+            aria-label="Switch mode"
+          >
+            Agent
+          </button>
+          <input
+            id="input"
+            type="text"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="What do you want me to do?"
+          />
+          <button
+            id="mic"
+            class="mic"
+            type="button"
+            title="Click to record, click again to stop"
+            aria-label="Record"
+          >
+            <svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
+              <path
+                d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3Z"
+                fill="currentColor"
+              />
+              <path
+                d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.9"
+                stroke-linecap="round"
+              />
+            </svg>
+            <span class="mic-level" id="mic-level"></span>
+          </button>
+          <button
+            class="rec"
+            id="rec"
+            type="button"
+            hidden
+            title="Screen memory is recording. Click to stop and forget everything."
+            aria-label="Stop screen memory"
+          >
+            <span class="rec-dot"></span>
+            <span class="rec-label" id="rec-label">10m</span>
+            <span class="rec-stop">Stop</span>
+          </button>
+          <button id="close" class="close" type="button" title="Close (Esc twice)">×</button>
+        </div>
+
+        <div class="thread" id="thread"></div>
+
+        <div class="status" id="status" hidden></div>
+
+        <ul class="options" id="options"></ul>
+
+        <div class="hints">
+          <span><kbd>↑</kbd><kbd>↓</kbd> pick</span>
+          <span><kbd>Enter</kbd> go</span>
+          <span><kbd>Esc</kbd> close</span>
+          <span class="hint-agent">type <kbd>/</kbd> for commands · drag to move</span>
+        </div>
+      </main>
+    </div>
+    <script type="module" src="./src/main.ts"></script>
+  </body>
+</html>
