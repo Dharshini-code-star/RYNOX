@@ -26,16 +26,38 @@
         </div>
 
         <button class="cta-button" id="new-chat" type="button" title="Start a new chat">
-          New Chat
+          <span aria-hidden="true">+</span>
+          <span>New chat</span>
         </button>
 
         <div class="sidebar-section">
-          <div class="sidebar-label">History</div>
+          <div class="history-heading">
+            <label class="sidebar-label" for="history-search">Recent chats</label>
+            <span class="history-count" id="history-count"></span>
+          </div>
+          <div class="history-search-wrap">
+            <svg viewBox="0 0 20 20" aria-hidden="true">
+              <circle cx="8.8" cy="8.8" r="5.7"></circle>
+              <path d="m13 13 4 4"></path>
+            </svg>
+            <input
+              class="history-search"
+              id="history-search"
+              type="search"
+              autocomplete="off"
+              placeholder="Search chats…"
+              aria-label="Search conversations"
+            />
+          </div>
           <ul class="history-list" id="history-list" aria-live="polite"></ul>
         </div>
 
-        <button class="sidebar-item" id="workflows" type="button">
-          Saved Workflows
+        <button class="sidebar-item" id="workflows" type="button" title="Open saved workflows">
+          <svg viewBox="0 0 20 20" aria-hidden="true">
+            <path d="M3.5 5.5h5l1.5 1.7h6.5v7.3h-13z"></path>
+            <path d="M3.5 5.5v-1h5l1.5 1.7"></path>
+          </svg>
+          <span>Saved workflows</span>
         </button>
 
         <button
@@ -50,60 +72,107 @@
         </button>
       </aside>
 
-      <main class="bar" id="bar">
+      <main class="bar" id="bar" data-conversation="false">
+        <section class="welcome" id="welcome" aria-labelledby="welcome-title">
+          <div class="welcome-emblem" role="img" aria-label="RYNOX luminous AI orb">
+            <div class="orb-halo"></div>
+            <div class="ai-orb">
+              <span class="orb-shell orb-shell-one"></span>
+              <span class="orb-shell orb-shell-two"></span>
+              <span class="orb-core"></span>
+            </div>
+          </div>
+          <h1 id="welcome-title">Your desktop. <span>Your intelligence.</span></h1>
+          <p class="welcome-subtitle">What can I help you accomplish today?</p>
+          <div class="suggestions" aria-label="Try a suggestion">
+            <button class="suggestion" type="button" data-suggestion="screen" title="Ask a question about your current screen">
+              <span class="suggestion-icon" aria-hidden="true">◉</span>
+              <span><strong>Understand My Screen</strong><small>Ask about visible content</small></span>
+              <span class="suggestion-arrow" aria-hidden="true">↗</span>
+            </button>
+            <button class="suggestion" type="button" data-suggestion="execute" title="Describe a task for Agent Mode">
+              <span class="suggestion-icon" aria-hidden="true">⌘</span>
+              <span><strong>Execute a Task</strong><small>Let RYNOX help get it done</small></span>
+              <span class="suggestion-arrow" aria-hidden="true">↗</span>
+            </button>
+            <button class="suggestion" type="button" data-suggestion="talk" title="Select Talk Mode and use voice input">
+              <span class="suggestion-icon" aria-hidden="true">♫</span>
+              <span><strong>Talk Naturally</strong><small>Ask with voice or text</small></span>
+              <span class="suggestion-arrow" aria-hidden="true">↗</span>
+            </button>
+            <button class="suggestion" type="button" data-suggestion="teach" title="Start a guided Teach Mode request">
+              <span class="suggestion-icon" aria-hidden="true">✳</span>
+              <span><strong>Learn with RYNOX</strong><small>Get a guided walkthrough</small></span>
+              <span class="suggestion-arrow" aria-hidden="true">↗</span>
+            </button>
+          </div>
+        </section>
+
         <div class="row">
           <span class="grip" title="Drag to move"></span>
-          <button
-            class="chip"
-            id="chip"
-            type="button"
-            data-mode="agent"
-            title="Switch between asking and acting"
-            aria-label="Switch mode"
-          >
-            Agent
-          </button>
-          <input
-            id="input"
-            type="text"
-            autocomplete="off"
-            spellcheck="false"
-            placeholder="What do you want me to do?"
-          />
-          <button
-            id="mic"
-            class="mic"
-            type="button"
-            title="Click to record, click again to stop"
-            aria-label="Record"
-          >
-            <svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
-              <path
-                d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3Z"
-                fill="currentColor"
-              />
-              <path
-                d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="1.9"
-                stroke-linecap="round"
-              />
-            </svg>
-            <span class="mic-level" id="mic-level"></span>
-          </button>
-          <button
-            class="rec"
-            id="rec"
-            type="button"
-            hidden
-            title="Screen memory is recording. Click to stop and forget everything."
-            aria-label="Stop screen memory"
-          >
-            <span class="rec-dot"></span>
-            <span class="rec-label" id="rec-label">10m</span>
-            <span class="rec-stop">Stop</span>
-          </button>
+          <div class="composer">
+            <input
+              id="input"
+              type="text"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder="Message RYNOX…"
+            />
+            <div class="composer-controls">
+              <div class="mode-switch" role="group" aria-label="Assistant mode">
+                <button class="mode-option" id="mode-talk" type="button" data-mode="talk" aria-pressed="false">Talk</button>
+                <button class="mode-option" id="mode-agent" type="button" data-mode="agent" aria-pressed="true">Agent</button>
+                <button class="mode-option" id="mode-teach" type="button" data-mode="teach" aria-pressed="false">Teach</button>
+              </div>
+              <span class="composer-spacer"></span>
+              <button
+                id="mic"
+                class="mic"
+                type="button"
+                title="Click to record, click again to stop"
+                aria-label="Record"
+              >
+                <svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
+                  <path
+                    d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3Z"
+                    fill="currentColor"
+                  />
+                  <path
+                    d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.9"
+                    stroke-linecap="round"
+                  />
+                </svg>
+                <span class="mic-level" id="mic-level"></span>
+              </button>
+              <button
+                class="rec"
+                id="rec"
+                type="button"
+                hidden
+                title="Screen memory is recording. Click to stop and forget everything."
+                aria-label="Stop screen memory"
+              >
+                <span class="rec-dot"></span>
+                <span class="rec-label" id="rec-label">10m</span>
+                <span class="rec-stop">Stop</span>
+              </button>
+              <button
+                id="send"
+                class="send"
+                type="button"
+                title="Send message (Enter)"
+                aria-label="Send message"
+              >
+                <svg viewBox="0 0 20 20" aria-hidden="true">
+                  <path d="M3.2 9.1 16.8 3.5l-4.4 13-2.2-5.2z"></path>
+                  <path d="m10.2 11.3 6.6-7.8"></path>
+                </svg>
+              </button>
+            </div>
+          </div>
           <button id="close" class="close" type="button" title="Close (Esc twice)">×</button>
         </div>
 
@@ -117,7 +186,7 @@
           <span><kbd>↑</kbd><kbd>↓</kbd> pick</span>
           <span><kbd>Enter</kbd> go</span>
           <span><kbd>Esc</kbd> close</span>
-          <span class="hint-agent">type <kbd>/</kbd> for commands · drag to move</span>
+          <span class="hint-agent">type <kbd>/</kbd> for commands</span>
         </div>
       </main>
     </div>

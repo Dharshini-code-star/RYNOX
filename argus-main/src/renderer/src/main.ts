@@ -14,25 +14,31 @@ import {
 import { filterOptions, type Option } from './options'
 
 const input = document.querySelector<HTMLInputElement>('#input')!
-const chip = document.querySelector<HTMLButtonElement>('#chip')!
+const modeTalkButton = document.querySelector<HTMLButtonElement>('#mode-talk')!
+const modeAgentButton = document.querySelector<HTMLButtonElement>('#mode-agent')!
+const modeTeachButton = document.querySelector<HTMLButtonElement>('#mode-teach')!
 const status = document.querySelector<HTMLDivElement>('#status')!
 const thread = document.querySelector<HTMLDivElement>('#thread')!
 const optionList = document.querySelector<HTMLUListElement>('#options')!
 const closeButton = document.querySelector<HTMLButtonElement>('#close')!
 const mic = document.querySelector<HTMLButtonElement>('#mic')!
 const micLevel = document.querySelector<HTMLSpanElement>('#mic-level')!
+const sendButton = document.querySelector<HTMLButtonElement>('#send')!
 const bar = document.querySelector<HTMLElement>('#bar')!
 const rec = document.querySelector<HTMLButtonElement>('#rec')!
 const recLabel = document.querySelector<HTMLSpanElement>('#rec-label')!
 const sidebar = document.querySelector<HTMLElement>('#sidebar')!
 const sidebarToggle = document.querySelector<HTMLButtonElement>('#sidebar-toggle')!
 const historyList = document.querySelector<HTMLUListElement>('#history-list')!
+const historySearch = document.querySelector<HTMLInputElement>('#history-search')!
+const historyCount = document.querySelector<HTMLSpanElement>('#history-count')!
 const newChatButton = document.querySelector<HTMLButtonElement>('#new-chat')!
 const workflowsButton = document.querySelector<HTMLButtonElement>('#workflows')!
 
 type StatusState = 'idle' | 'busy' | 'done' | 'error'
 
 let activeThreadId: string | null = null
+let savedThreads: Array<{ id: string; title: string; updatedAt: number; questions: number }> = []
 
 /** True between hitting Enter and the answer resolving. */
 let awaitingAnswer = false
@@ -43,8 +49,9 @@ let visible: Option[] = []
 let highlighted = -1
 /** The answer element currently being streamed into. */
 let activeAnswer: HTMLDivElement | null = null
+let activeAnswerText = ''
 /**
- * Set only when the chip was clicked. Null means follow the wording, which is
+ * Set only when a mode control was clicked. Null means follow the wording, which is
  * what most requests want; an explicit choice outranks the guess.
  */
 let manualMode: Mode | null = null
@@ -89,11 +96,16 @@ function currentMode(): Mode {
 function syncChip(): void {
   const mode = currentMode()
   const { teach } = parseTeachRequest(parseMode(input.value).prompt)
-
-  // Teaching is a modifier rather than a third mode, but it changes the outcome
-  // enough that the chip has to say so before Enter is pressed.
-  chip.dataset['mode'] = teach ? 'teach' : mode
-  chip.textContent = teach ? 'Teach' : mode === 'agent' ? 'Agent' : 'Talk'
+  const selectedMode = teach ? 'teach' : mode
+  for (const [button, buttonMode] of [
+    [modeTalkButton, 'talk'],
+    [modeAgentButton, 'agent'],
+    [modeTeachButton, 'teach']
+  ] as const) {
+    const selected = buttonMode === selectedMode
+    button.setAttribute('aria-pressed', String(selected))
+    button.dataset['selected'] = String(selected)
+  }
 
   input.placeholder = teach
     ? mode === 'agent'
@@ -102,6 +114,26 @@ function syncChip(): void {
     : mode === 'agent'
       ? 'What do you want me to do?'
       : 'What do you want to know?'
+}
+
+function chooseMode(mode: Mode | 'teach'): void {
+  const parsedTeach = parseTeachRequest(input.value)
+  if (mode === 'teach') {
+    if (!parsedTeach.teach) {
+      const request = input.value.trim()
+      input.value = request ? `Teach me how to ${request}` : 'Teach me how to '
+    }
+    manualMode = null
+  } else {
+    if (parsedTeach.teach) input.value = parsedTeach.topic
+    manualMode = mode
+  }
+
+  syncChip()
+  input.focus()
+  if (mode === 'teach' && input.value.endsWith(' ')) {
+    input.setSelectionRange(input.value.length, input.value.length)
+  }
 }
 
 /** Appends a question to the transcript and returns its (empty) answer node. */
@@ -118,13 +150,104 @@ function appendExchange(question: string): HTMLDivElement {
 
   block.append(asked, answer)
   thread.append(block)
+  bar.dataset['conversation'] = 'true'
   thread.scrollTop = thread.scrollHeight
   return answer
 }
 
+function appendInlineFormatting(parent: HTMLElement, text: string): void {
+  const pattern = /(`[^`\n]+`|\*\*[^*\n]+\*\*)/g
+  let offset = 0
+  for (const match of text.matchAll(pattern)) {
+    const token = match[0]
+    const index = match.index
+    if (index > offset) parent.append(document.createTextNode(text.slice(offset, index)))
+    if (token.startsWith('`')) {
+      const code = document.createElement('code')
+      code.className = 'inline-code'
+      code.textContent = token.slice(1, -1)
+      parent.append(code)
+    } else {
+      const strong = document.createElement('strong')
+      strong.textContent = token.slice(2, -2)
+      parent.append(strong)
+    }
+    offset = index + token.length
+  }
+  if (offset < text.length) parent.append(document.createTextNode(text.slice(offset)))
+}
+
+/** Formats basic model Markdown using text nodes only; model output is never HTML. */
+function renderAnswer(answer: HTMLDivElement, text: string): void {
+  answer.replaceChildren()
+  const lines = text.split(/\r?\n/)
+  let paragraph: string[] = []
+  let list: HTMLOListElement | HTMLUListElement | null = null
+
+  const flushParagraph = (): void => {
+    if (paragraph.length === 0) return
+    const block = document.createElement('p')
+    appendInlineFormatting(block, paragraph.join('\n'))
+    answer.append(block)
+    paragraph = []
+  }
+  const flushList = (): void => {
+    list = null
+  }
+
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index]!
+    const fence = line.match(/^\s*```([^\s`]*)\s*$/)
+    if (fence) {
+      flushParagraph()
+      flushList()
+      const codeLines: string[] = []
+      while (++index < lines.length && !/^\s*```\s*$/.test(lines[index]!)) {
+        codeLines.push(lines[index]!)
+      }
+      const pre = document.createElement('pre')
+      const code = document.createElement('code')
+      code.className = 'code-block'
+      if (fence[1]) code.dataset['language'] = fence[1]
+      code.textContent = codeLines.join('\n')
+      pre.append(code)
+      answer.append(pre)
+      continue
+    }
+
+    if (!line.trim()) {
+      flushParagraph()
+      flushList()
+      continue
+    }
+
+    const item = line.match(/^\s*(?:[-*+]\s+|(\d+)[.)]\s+)(.*)$/)
+    if (item) {
+      flushParagraph()
+      const ordered = item[1] !== undefined
+      if (!list || (ordered !== (list instanceof HTMLOListElement))) {
+        flushList()
+        list = document.createElement(ordered ? 'ol' : 'ul')
+        answer.append(list)
+      }
+      const entry = document.createElement('li')
+      appendInlineFormatting(entry, item[2]!)
+      list.append(entry)
+      continue
+    }
+
+    flushList()
+    paragraph.push(line)
+  }
+
+  flushParagraph()
+}
+
 function clearThread(): void {
   thread.replaceChildren()
+  bar.dataset['conversation'] = 'false'
   activeAnswer = null
+  activeAnswerText = ''
 }
 
 /**
@@ -148,7 +271,7 @@ function showTutorialPage(index: number): void {
   clearThread()
 
   const node = appendExchange(content.title)
-  node.textContent = content.tip ? `${content.body}\n\n→ ${content.tip}` : content.body
+  renderAnswer(node, content.tip ? `${content.body}\n\n→ ${content.tip}` : content.body)
 
   input.value = ''
   highlighted = -1
@@ -216,6 +339,7 @@ function showingHistory(): boolean {
 
 async function refreshThreads(): Promise<void> {
   const threads = await window.argus.threads()
+  savedThreads = threads
   threadOptions = threads.map((thread) => ({
     id: `thread:${thread.id}`,
     label: thread.title,
@@ -229,7 +353,7 @@ async function refreshThreads(): Promise<void> {
     ]
   }
 
-  renderSidebarHistory(threads)
+  renderSidebarHistory()
   renderOptions()
 }
 
@@ -253,9 +377,40 @@ function renderOptions(): void {
   paintOptions()
 }
 
-function renderSidebarHistory(threads: Array<{ id: string; title: string; updatedAt: number; questions: number }>): void {
-  historyList.replaceChildren(
-    ...threads.map((threadSummary) => {
+function renderSidebarHistory(): void {
+  const query = historySearch.value.trim().toLocaleLowerCase()
+  const filtered = savedThreads.filter((threadSummary) =>
+    threadSummary.title.toLocaleLowerCase().includes(query)
+  )
+  historyCount.textContent = query ? `${filtered.length}/${savedThreads.length}` : `${savedThreads.length}`
+
+  const now = new Date()
+  const startToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
+  const yesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1)
+  const startYesterday = yesterday.getTime()
+  const groups = [
+    { title: 'Today', threads: [] as typeof filtered },
+    { title: 'Yesterday', threads: [] as typeof filtered },
+    { title: 'Previous', threads: [] as typeof filtered }
+  ]
+  for (const threadSummary of filtered) {
+    const group = threadSummary.updatedAt >= startToday
+      ? groups[0]
+      : threadSummary.updatedAt >= startYesterday
+        ? groups[1]
+        : groups[2]
+    group.threads.push(threadSummary)
+  }
+
+  const entries: HTMLLIElement[] = []
+  for (const group of groups) {
+    if (group.threads.length === 0) continue
+    const heading = document.createElement('li')
+    heading.className = 'history-group-label'
+    heading.textContent = group.title
+    entries.push(heading)
+
+    for (const threadSummary of group.threads) {
       const entry = document.createElement('li')
       entry.className = 'history-entry'
       const row = document.createElement('button')
@@ -276,14 +431,16 @@ function renderSidebarHistory(threads: Array<{ id: string; title: string; update
         void resumeThread(threadSummary.id)
       })
       entry.append(row)
-      return entry
-    })
-  )
+      entries.push(entry)
+    }
+  }
 
-  if (threads.length === 0) {
+  historyList.replaceChildren(...entries)
+
+  if (filtered.length === 0) {
     const empty = document.createElement('li')
     empty.className = 'history-empty'
-    empty.textContent = 'No saved chats yet'
+    empty.textContent = query ? 'No matching conversations.' : 'No saved chats yet'
     historyList.append(empty)
   }
 }
@@ -356,7 +513,8 @@ async function resumeThread(id: string): Promise<void> {
 
   const turns = await window.argus.openThread(id)
   activeThreadId = id
-  renderSidebarHistory(await window.argus.threads())
+  savedThreads = await window.argus.threads()
+  renderSidebarHistory()
   clearThread()
 
   for (let index = 0; index < turns.length; index += 2) {
@@ -364,7 +522,7 @@ async function resumeThread(id: string): Promise<void> {
     const answer = turns[index + 1]
     if (!question) continue
     const node = appendExchange(question.text)
-    node.textContent = answer?.text ?? ''
+    renderAnswer(node, answer?.text ?? '')
   }
 
   input.value = ''
@@ -425,10 +583,13 @@ function submit(text: string): void {
   awaitingAnswer = true
   streaming = false
   input.disabled = true
+  sendButton.disabled = true
+  bar.setAttribute('aria-busy', 'true')
   highlighted = -1
 
   // Commands report through the status line; questions join the transcript.
   activeAnswer = isCommand ? null : appendExchange(trimmed)
+  activeAnswerText = ''
   setStatus(
     isBareKey
       ? 'Saving your key…'
@@ -455,7 +616,8 @@ function submit(text: string): void {
     .submit(isBareKey ? `/key ${trimmed}` : trimmed, forced)
     .then((result) => {
       if (activeAnswer && result.ok) {
-        activeAnswer.textContent = result.message
+        activeAnswerText = result.message
+        renderAnswer(activeAnswer, activeAnswerText)
         setStatus('')
       } else {
         if (activeAnswer && !result.ok) {
@@ -476,7 +638,10 @@ function submit(text: string): void {
       awaitingAnswer = false
       streaming = false
       activeAnswer = null
+      activeAnswerText = ''
       input.disabled = false
+      sendButton.disabled = false
+      bar.removeAttribute('aria-busy')
       input.value = retry
       // A retry keeps the mode it was asked in. Re-guessing it from the
       // wording could turn a question asked in Talk into an Agent run.
@@ -549,7 +714,8 @@ window.argus.onDelta((delta) => {
     setStatus('')
   }
   if (activeAnswer) {
-    activeAnswer.textContent += delta
+    activeAnswerText += delta
+    renderAnswer(activeAnswer, activeAnswerText)
     thread.scrollTop = thread.scrollHeight
   }
 })
@@ -601,9 +767,50 @@ newChatButton.addEventListener('click', () => {
   })
 })
 
+historySearch.addEventListener('input', () => renderSidebarHistory())
+
+historySearch.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') {
+    historySearch.value = ''
+    renderSidebarHistory()
+    input.focus()
+  }
+})
+
+document.querySelectorAll<HTMLButtonElement>('[data-suggestion]').forEach((button) => {
+  button.addEventListener('click', () => {
+    switch (button.dataset['suggestion']) {
+      case 'screen':
+        manualMode = 'talk'
+        input.value = 'What is on my screen?'
+        syncChip()
+        submit(input.value)
+        break
+      case 'execute':
+        manualMode = 'agent'
+        syncChip()
+        setStatus('Agent Mode selected. Describe the task you want help with.')
+        input.focus()
+        break
+      case 'talk':
+        manualMode = 'talk'
+        syncChip()
+        setStatus('Talk Mode selected. Type a question or use the microphone.')
+        input.focus()
+        break
+      case 'teach':
+        chooseMode('teach')
+        syncChip()
+        break
+    }
+  })
+})
+
 workflowsButton.addEventListener('click', () => {
   submit('/workflows')
 })
+
+sendButton.addEventListener('click', () => submit(input.value))
 
 sidebarToggle.addEventListener('click', () => {
   const collapsed = sidebar.classList.toggle('collapsed')
@@ -631,16 +838,14 @@ input.addEventListener('input', () => {
   renderOptions()
 })
 
-/**
- * The chip is the switch between asking and acting. Clicking it pins the mode
- * for this one request; it goes back to following the wording afterwards.
- */
+/** The mode selector pins Talk or Agent; Teach uses the shared request parser. */
 /**
  * Click to start, click again to stop.
  *
  * A toggle is easier to use than hold-to-talk, and brings one hazard
  * hold-to-talk did not have: a microphone left recording because the second
- * click never came. Three things close that off - the bar is unmistakably red
+ * click never came. Three things close that off - the microphone state is
+ * unmistakable
  * while live, Escape cancels, and a recording stops itself at
  * MAX_RECORDING_MS whatever the user does.
  */
@@ -778,11 +983,9 @@ mic.addEventListener('click', () => {
   }
 })
 
-chip.addEventListener('click', () => {
-  manualMode = currentMode() === 'agent' ? 'talk' : 'agent'
-  syncChip()
-  input.focus()
-})
+modeTalkButton.addEventListener('click', () => chooseMode('talk'))
+modeAgentButton.addEventListener('click', () => chooseMode('agent'))
+modeTeachButton.addEventListener('click', () => chooseMode('teach'))
 
 input.addEventListener('keydown', (event) => {
   if (event.key === 'Escape') {
@@ -841,7 +1044,9 @@ input.addEventListener('keydown', (event) => {
 function syncHeight(): void {
   const style = getComputedStyle(bar)
   const margins = parseFloat(style.marginTop) + parseFloat(style.marginBottom)
-  window.argus.resize(Math.ceil(bar.getBoundingClientRect().height + margins))
+  const bodyStyle = getComputedStyle(document.body)
+  const padding = parseFloat(bodyStyle.paddingTop) + parseFloat(bodyStyle.paddingBottom)
+  window.argus.resize(Math.ceil(bar.getBoundingClientRect().height + margins + padding))
 }
 
 new ResizeObserver(syncHeight).observe(bar)
