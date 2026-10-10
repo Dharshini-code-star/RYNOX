@@ -1,5 +1,5 @@
 {
-  "name": "argus",
+  "name": "rynox_main",
   "version": "0.1.0",
   "description": "Screen-aware AI assistant for Windows. Press a hotkey, ask about anything on your screen, or let it operate your PC for you.",
   "main": "./out/main/index.js",
@@ -37,10 +37,10 @@
     "@nut-tree-fork/nut-js": "^4.2.6",
     "uiohook-napi": "^1.5.5"
   },
-  "author": "nikeshsundar",
-  "homepage": "https://nikeshsundar.github.io/argus",
+  "author": "Dharshini-code-star",
+  "homepage": "https://Dharshini-code-star.github.io/rynox_main",
   "repository": {
     "type": "git",
-    "url": "https://github.com/nikeshsundar/argus.git"
+    "url": "https://github.com/Dharshini-code-star/rynox_main.git"
   }
 }
